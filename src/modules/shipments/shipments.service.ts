@@ -6,12 +6,31 @@ import { UserModel } from '../users/users.model.js';
 import { emitStatusUpdate } from '../../infra/socket/io.js';
 import { Anomaly } from '../anomaly/anomaly.model.js';
 import { Telemetry } from '../telemetry/telemetry.model.js';
+import { TelemetryAnchorStatus } from '../../shared/types/telemetry.js';
 import { AppError } from '../../shared/http/errors.js';
 import { IShipment, ShipmentStatus } from '../../shared/types/shipment.js';
 import { auditLog } from '../../shared/utils/auditLog.js';
+import { logger } from '../../shared/logger/logger.js';
 import { invalidateAnalyticsPerformanceCache } from '../analytics/analytics.cache.js';
 import * as paymentsRepo from '../payments/payments.repo.js';
 import { PaymentStatus } from '../payments/payments.model.js';
+import { validateStatusTransition } from '../../shared/constants/shipmentStateMachine.js';
+import type { BulkStatusUpdateInput } from './shipments.validation.js';
+import { offsetSkip } from '../../shared/utils/pagination.js';
+import {
+  readShipmentEtaCache,
+  writeShipmentEtaCache,
+  invalidateShipmentEtaCache,
+  type ShipmentEtaPayload,
+} from './shipmentsEta.cache.js';
+import { isAuthorizedForShipment } from '../../infra/socket/shipmentRooms.js';
+import { ErrorCodes } from '../../shared/http/errors.js';
+import { UserRole } from '../../shared/constants/index.js';
+
+type BulkUpdateResult = {
+  updated: number;
+  failed: Array<{ id: string; reason: string }>;
+};
 
 type ShipmentListResult = {
   data: IShipment[];
@@ -20,30 +39,185 @@ type ShipmentListResult = {
   total: number;
 };
 
+type Coordinates = {
+  latitude: number;
+  longitude: number;
+};
+
+type TelemetryPoint = {
+  latitude: number;
+  longitude: number;
+  timestamp: Date;
+};
+
+const ETA_POINTS_WINDOW = 8;
+const MIN_EFFECTIVE_SPEED_KMH = 5;
+const DEFAULT_SINGLE_POINT_SPEED_KMH = 40;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function readNumberField(record: Record<string, unknown>, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function extractCoordinates(value: unknown): Coordinates | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const latitude = readNumberField(value, ['latitude', 'lat']);
+  const longitude = readNumberField(value, ['longitude', 'lng', 'lon']);
+
+  if (latitude === null || longitude === null) {
+    return null;
+  }
+
+  return { latitude, longitude };
+}
+
+function resolveDestinationCoordinates(metadata: unknown): Coordinates | null {
+  if (!isRecord(metadata)) {
+    return null;
+  }
+
+  const direct = extractCoordinates(metadata.destinationCoordinates);
+  if (direct) {
+    return direct;
+  }
+
+  const nestedDestination = extractCoordinates(metadata.destination);
+  if (nestedDestination) {
+    return nestedDestination;
+  }
+
+  const route = isRecord(metadata.route) ? metadata.route : null;
+  const routeDestination = route ? extractCoordinates(route.destination) : null;
+  if (routeDestination) {
+    return routeDestination;
+  }
+
+  return null;
+}
+
+function toRadians(degrees: number): number {
+  return (degrees * Math.PI) / 180;
+}
+
+function calculateDistanceKm(from: Coordinates, to: Coordinates): number {
+  const earthRadiusKm = 6371;
+  const deltaLatitude = toRadians(to.latitude - from.latitude);
+  const deltaLongitude = toRadians(to.longitude - from.longitude);
+
+  const a =
+    Math.sin(deltaLatitude / 2) * Math.sin(deltaLatitude / 2) +
+    Math.cos(toRadians(from.latitude)) *
+      Math.cos(toRadians(to.latitude)) *
+      Math.sin(deltaLongitude / 2) *
+      Math.sin(deltaLongitude / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
+function calculateAverageSpeedKmh(points: TelemetryPoint[]): number {
+  if (points.length < 2) {
+    return DEFAULT_SINGLE_POINT_SPEED_KMH;
+  }
+
+  const chronological = [...points].reverse();
+  let distanceKm = 0;
+  let elapsedHours = 0;
+
+  for (let index = 1; index < chronological.length; index += 1) {
+    const previous = chronological[index - 1];
+    const current = chronological[index];
+
+    const segmentHours = (current.timestamp.getTime() - previous.timestamp.getTime()) / 3600000;
+    if (segmentHours <= 0) {
+      continue;
+    }
+
+    distanceKm += calculateDistanceKm(previous, current);
+    elapsedHours += segmentHours;
+  }
+
+  if (elapsedHours <= 0) {
+    return DEFAULT_SINGLE_POINT_SPEED_KMH;
+  }
+
+  return distanceKm / elapsedHours;
+}
+
+function inferEtaConfidence(pointsCount: number, averageSpeed: number): 'LOW' | 'MEDIUM' | 'HIGH' {
+  if (pointsCount >= 6 && averageSpeed >= 15) {
+    return 'HIGH';
+  }
+
+  if (pointsCount >= 3 && averageSpeed >= 8) {
+    return 'MEDIUM';
+  }
+
+  return 'LOW';
+}
+
+/**
+ * Queries shipments directly by filter, skip, and limit.
+ * @param {FilterQuery<unknown>} query - MongoDB filter query.
+ * @param {number} skip - Number of records to skip.
+ * @param {number} limit - Maximum number of records to return.
+ * @returns {Promise<IShipment[]>} Matching shipment documents.
+ */
 export const findShipments = async (
   query: FilterQuery<unknown>,
   skip: number,
   limit: number
 ): Promise<IShipment[]> => {
-  return Shipment.find(query)
-    .sort({ createdAt: -1, _id: -1 })
-    .skip(skip)
-    .limit(limit)
-    .lean();
+  return Shipment.find(query).sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit).lean();
 };
 
+/**
+ * Retrieves a paginated list of shipments using filters and optional search criteria.
+ * @param {object} params - Pagination and filter parameters.
+ * @returns {Promise<ShipmentListResult>} Paginated shipment results.
+ */
 export const getShipmentsService = async (params: {
-  status?: string;
+  status?: string | string[];
   page: number;
   limit: number;
   origin?: string;
   destination?: string;
+  trackingNumber?: string;
+  q?: string;
+  from?: Date;
+  to?: Date;
   filters: Record<string, unknown>;
 }): Promise<ShipmentListResult> => {
-  const { status, page, limit, origin, destination, filters } = params;
-  const query: FilterQuery<unknown> = { ...filters };
+  const { status, page, limit, origin, destination, trackingNumber, q, from, to, filters } = params;
+  const query: FilterQuery<unknown> = {};
 
-  if (status) query.status = status;
+  if (filters.organizationId) {
+    query.organizationId = filters.organizationId;
+  }
+
+  if (status) {
+    const statuses = Array.isArray(status) ? status : [status];
+    query.status = statuses.length === 1 ? statuses[0] : { $in: statuses };
+  }
+
+  if (trackingNumber) {
+    const escaped = trackingNumber.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.trackingNumber = { $regex: escaped, $options: 'i' };
+  }
+
   if (origin) {
     const escapedOrigin = origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     query.origin = { $regex: escapedOrigin, $options: 'i' };
@@ -53,7 +227,19 @@ export const getShipmentsService = async (params: {
     query.destination = { $regex: escapedDestination, $options: 'i' };
   }
 
-  const skip = (page - 1) * limit;
+  if (q) {
+    // Uses text index on trackingNumber, origin, destination
+    query.$text = { $search: q };
+  }
+
+  if (from || to) {
+    const createdAt: { $gte?: Date; $lte?: Date } = {};
+    if (from) createdAt.$gte = from;
+    if (to) createdAt.$lte = to;
+    query.createdAt = createdAt;
+  }
+
+  const skip = offsetSkip(page, limit);
   const [data, total] = await Promise.all([
     findShipments(query, skip, limit),
     Shipment.countDocuments(query),
@@ -62,6 +248,178 @@ export const getShipmentsService = async (params: {
   return { data, page, limit, total };
 };
 
+export const getShipmentByIdService = async (
+  id: string,
+  context?: { organizationId?: string; role?: string }
+): Promise<IShipment> => {
+  const shipment = await Shipment.findById(id).lean<IShipment>();
+  if (!shipment) {
+    throw new AppError(404, 'Shipment not found', ErrorCodes.SHIPMENT_NOT_FOUND);
+  }
+
+  const isSuperAdmin = context?.role === UserRole.SUPER_ADMIN;
+  if (!isSuperAdmin) {
+    if (!context?.organizationId) {
+      throw new AppError(
+        403,
+        'Forbidden: insufficient access to shipment',
+        ErrorCodes.FORBIDDEN
+      );
+    }
+    const authorized = await isAuthorizedForShipment({
+      shipmentId: id,
+      organizationId: context.organizationId,
+    });
+    if (!authorized) {
+      throw new AppError(
+        403,
+        'Forbidden: insufficient access to shipment',
+        ErrorCodes.FORBIDDEN
+      );
+    }
+  }
+
+  return shipment;
+};
+
+export type ShipmentTimelineEventType =
+  | 'STATUS_CHANGE'
+  | 'TELEMETRY_ANCHORED'
+  | 'ANOMALY_DETECTED'
+  | 'PROOF_UPLOADED';
+
+export interface ShipmentTimelineEvent {
+  type: ShipmentTimelineEventType;
+  timestamp: string;
+  description: string;
+  metadata: Record<string, unknown>;
+}
+
+type TimelineEventWithCursor = ShipmentTimelineEvent & { cursorKey: string };
+
+function buildTimelineCursorKey(timestamp: string, suffix: string): string {
+  return `${timestamp}|${suffix}`;
+}
+
+export const getShipmentTimelineService = async (
+  id: string,
+  params: { cursor?: string; limit: number; organizationId?: string; role?: string }
+): Promise<{ data: ShipmentTimelineEvent[]; nextCursor: string | null; hasMore: boolean }> => {
+  const shipment = await getShipmentByIdService(id, {
+    organizationId: params.organizationId,
+    role: params.role,
+  });
+
+  const events: TimelineEventWithCursor[] = [];
+
+  for (const milestone of shipment.milestones ?? []) {
+    const timestamp = new Date(milestone.timestamp).toISOString();
+    events.push({
+      type: 'STATUS_CHANGE',
+      timestamp,
+      description: milestone.description ?? `Status changed to ${milestone.name}`,
+      metadata: {
+        status: milestone.name,
+        userId: milestone.userId,
+        walletAddress: milestone.walletAddress,
+      },
+      cursorKey: buildTimelineCursorKey(timestamp, `status-${milestone.name}`),
+    });
+  }
+
+  const proof = shipment.deliveryProof as
+    | {
+        url?: string;
+        recipientSignatureName?: string;
+        notes?: string;
+        uploadedAt?: Date | string;
+      }
+    | undefined;
+
+  if (proof?.uploadedAt) {
+    const timestamp = new Date(proof.uploadedAt).toISOString();
+    events.push({
+      type: 'PROOF_UPLOADED',
+      timestamp,
+      description: 'Proof of delivery uploaded',
+      metadata: {
+        url: proof.url,
+        recipientSignatureName: proof.recipientSignatureName,
+        notes: proof.notes,
+      },
+      cursorKey: buildTimelineCursorKey(timestamp, 'proof'),
+    });
+  }
+
+  const [telemetryRows, anomalyRows] = await Promise.all([
+    Telemetry.find({ shipmentId: id, anchorStatus: TelemetryAnchorStatus.ANCHORED }).lean(),
+    Anomaly.find({ shipmentId: id }).lean(),
+  ]);
+
+  for (const row of telemetryRows) {
+    const timestamp = new Date(row.timestamp).toISOString();
+    events.push({
+      type: 'TELEMETRY_ANCHORED',
+      timestamp,
+      description: 'Telemetry record anchored on Stellar',
+      metadata: {
+        telemetryId: row._id.toString(),
+        stellarTxHash: row.stellarTxHash,
+        dataHash: row.dataHash,
+      },
+      cursorKey: buildTimelineCursorKey(timestamp, `telemetry-${row._id.toString()}`),
+    });
+  }
+
+  for (const row of anomalyRows) {
+    const timestamp = new Date(row.timestamp).toISOString();
+    events.push({
+      type: 'ANOMALY_DETECTED',
+      timestamp,
+      description: row.message,
+      metadata: {
+        anomalyId: row._id.toString(),
+        type: row.type,
+        severity: row.severity,
+        resolved: row.resolved,
+      },
+      cursorKey: buildTimelineCursorKey(timestamp, `anomaly-${row._id.toString()}`),
+    });
+  }
+
+  events.sort((a, b) => {
+    const byTime = a.timestamp.localeCompare(b.timestamp);
+    if (byTime !== 0) return byTime;
+    return a.cursorKey.localeCompare(b.cursorKey);
+  });
+
+  let startIndex = 0;
+  if (params.cursor) {
+    const cursorIndex = events.findIndex(event => event.cursorKey === params.cursor);
+    startIndex = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+  }
+
+  const page = events.slice(startIndex, startIndex + params.limit + 1);
+  const hasMore = page.length > params.limit;
+  const pageEvents = hasMore ? page.slice(0, params.limit) : page;
+  const nextCursor =
+    hasMore && pageEvents.length > 0
+      ? pageEvents[pageEvents.length - 1].cursorKey
+      : null;
+
+  const data = pageEvents.map(({ cursorKey: _cursorKey, ...event }) => event);
+
+  return { data, nextCursor, hasMore };
+};
+
+/**
+ * Creates a new shipment record and attempts Stellar tokenization.
+ * @param {object} data - Shipment creation payload.
+ * @param {string=} data.trackingNumber - Optional tracking number.
+ * @param {string} data.origin - Shipment origin.
+ * @param {string} data.destination - Shipment destination.
+ * @returns {Promise<unknown>} Created shipment document.
+ */
 export const createShipmentService = async (data: {
   trackingNumber?: string;
   origin: string;
@@ -84,16 +442,30 @@ export const createShipmentService = async (data: {
     shipment.stellarTxHash = stellar.stellarTxHash;
     await shipment.save();
   } catch (err) {
-    console.warn('Stellar tokenization skipped:', (err as Error).message);
+    logger.warn({ err, shipmentId: shipment._id.toString() }, 'Stellar tokenization skipped');
   }
 
   return shipment;
 };
 
+/**
+ * Updates shipment off-chain metadata.
+ * @param {string} id - Shipment ObjectId.
+ * @param {unknown} offChainMetadata - Off-chain metadata payload.
+ * @returns {Promise<unknown>} Updated shipment document.
+ */
 export const patchShipmentService = async (id: string, offChainMetadata: unknown) => {
   return Shipment.findByIdAndUpdate(id, { offChainMetadata }, { new: true });
 };
 
+/**
+ * Updates a shipment's status, records a milestone, and emits status events.
+ * @param {string} id - Shipment ObjectId.
+ * @param {ShipmentStatus} status - New shipment status.
+ * @param {{userId?: string; walletAddress?: string}=} actor - Optional actor metadata.
+ * @returns {Promise<unknown>} Updated shipment document or null when not found.
+ * @throws {AppError} 400 when the status transition is invalid.
+ */
 export const updateShipmentStatusService = async (
   id: string,
   status: ShipmentStatus,
@@ -104,9 +476,7 @@ export const updateShipmentStatusService = async (
 
   if (shipment.status === status) return shipment;
 
-  if (!Object.values(ShipmentStatus).includes(status)) {
-    throw new Error('Invalid status');
-  }
+  validateStatusTransition(shipment.status as ShipmentStatus, status);
 
   const previousStatus = shipment.status;
   shipment.status = status;
@@ -153,6 +523,7 @@ export const updateShipmentStatusService = async (
 
   await shipment.save();
   await invalidateAnalyticsPerformanceCache();
+  await invalidateShipmentEtaCache(id);
 
   // Trigger escrow release on delivery
   if (status === ShipmentStatus.DELIVERED) {
@@ -168,19 +539,21 @@ export const updateShipmentStatusService = async (
           await paymentsRepo.updatePaymentStatus(
             payment._id.toString(),
             PaymentStatus.RELEASED,
-            releaseResult.transactionHash,
+            releaseResult.transactionHash
           );
           console.log(
             `[Shipment] Escrow released for shipment ${id}, ` +
-              `tx: ${releaseResult.transactionHash}`,
+              `tx: ${releaseResult.transactionHash}`
+          );
+          logger.info(
+            { shipmentId: id, transactionHash: releaseResult.transactionHash },
+            'Escrow released for shipment'
           );
         }
       }
     } catch (escrowError) {
-      console.warn(
-        `[Shipment] Failed to trigger escrow release for ${id}:`,
-        escrowError,
-      );
+      console.warn(`[Shipment] Failed to trigger escrow release for ${id}:`, escrowError);
+      logger.warn({ err: escrowError, shipmentId: id }, 'Failed to trigger escrow release');
       // Don't fail the shipment status update if escrow release fails
       // The payment status can be manually updated later via webhook
     }
@@ -201,31 +574,40 @@ export const updateShipmentStatusService = async (
     status: shipment.status,
     milestones: shipment.milestones.map(m => ({
       name: m.name,
-      timestamp: m.timestamp,
+      timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
       description: m.description ?? undefined,
       userId: m.userId?.toString() ?? undefined,
       walletAddress: m.walletAddress ?? undefined,
     })),
-    updatedAt: shipment.updatedAt,
+    updatedAt:
+      shipment.updatedAt instanceof Date ? shipment.updatedAt.toISOString() : shipment.updatedAt,
   });
 
   return shipment;
 };
 
+/**
+ * Uploads delivery proof and attaches it to a shipment.
+ * @param {string} id - Shipment ObjectId.
+ * @param {Express.Multer.File} file - Proof file upload.
+ * @param {{recipientSignatureName?: string; notes?: string}} proof - Proof metadata.
+ * @returns {Promise<unknown>} Updated shipment document.
+ * @throws {AppError} When storage upload fails.
+ */
 export const uploadShipmentProofService = async (
   id: string,
   file: Express.Multer.File,
-  proof: { recipientSignatureName?: string; notes?: string },
+  proof: { recipientSignatureName?: string; notes?: string }
 ) => {
   let proofUrl: string;
 
   try {
     proofUrl = await mockUploadToStorage(file);
-  } catch (err) {
+  } catch {
     throw new AppError(
       503,
       'Storage bucket unavailable, please try again later.',
-      'SERVICE_UNAVAILABLE',
+      'SERVICE_UNAVAILABLE'
     );
   }
 
@@ -244,6 +626,68 @@ export const uploadShipmentProofService = async (
   return shipment;
 };
 
+const EXPORT_MAX_RECORDS = 10_000;
+
+/**
+ * Exports shipments matching the given filters as an array (max 10,000).
+ * Returns 400 if the result set exceeds the limit.
+ */
+export const exportShipmentsService = async (params: {
+  organizationId?: string;
+  status?: string;
+  origin?: string;
+  destination?: string;
+  startDate?: string;
+  endDate?: string;
+}): Promise<IShipment[]> => {
+  const { organizationId, status, origin, destination, startDate, endDate } = params;
+  const query: FilterQuery<unknown> = {};
+
+  if (organizationId) query.organizationId = organizationId;
+  if (status) query.status = status;
+  if (origin) {
+    const escaped = origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.origin = { $regex: escaped, $options: 'i' };
+  }
+  if (destination) {
+    const escaped = destination.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    query.destination = { $regex: escaped, $options: 'i' };
+  }
+  if (startDate || endDate) {
+    query.createdAt = {};
+    if (startDate) (query.createdAt as Record<string, unknown>).$gte = new Date(startDate);
+    if (endDate) (query.createdAt as Record<string, unknown>).$lte = new Date(endDate);
+  }
+
+  const count = await Shipment.countDocuments(query);
+  if (count > EXPORT_MAX_RECORDS) {
+    throw new AppError(
+      400,
+      `Export exceeds ${EXPORT_MAX_RECORDS} records (${count} found). Please narrow your filters.`,
+      'EXPORT_TOO_LARGE'
+    );
+  }
+
+  return Shipment.find(query).sort({ createdAt: -1 }).limit(EXPORT_MAX_RECORDS).lean();
+};
+
+/**
+ * Converts shipment records to CSV string.
+ */
+export function shipmentsToCSV(shipments: IShipment[]): string {
+  const headers = ['_id', 'trackingNumber', 'origin', 'destination', 'status', 'createdAt', 'updatedAt'];
+  const escape = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = shipments.map(s =>
+    headers.map(h => escape((s as unknown as Record<string, unknown>)[h])).join(',')
+  );
+  return [headers.join(','), ...rows].join('\n');
+}
+
+/**
+ * Soft deletes a shipment and cascades deletion markers to related telemetry and anomaly documents.
+ * @param {string} id - Shipment ObjectId.
+ * @returns {Promise<unknown>} Deleted shipment document or null.
+ */
 export const deleteShipmentService = async (id: string) => {
   const shipment = await Shipment.findByIdAndUpdate(id, { deletedAt: new Date() }, { new: true });
   if (!shipment) return null;
@@ -254,4 +698,62 @@ export const deleteShipmentService = async (id: string) => {
   ]);
 
   return shipment;
+};
+
+export const getShipmentEtaService = async (id: string): Promise<ShipmentEtaPayload> => {
+  const cached = await readShipmentEtaCache(id);
+  if (cached) {
+    return cached;
+  }
+
+  const shipment = await Shipment.findById(id).lean();
+  if (!shipment) {
+    throw new AppError(404, 'Shipment not found', 'ERR_SHIPMENT_NOT_FOUND');
+  }
+
+  if (shipment.status !== ShipmentStatus.IN_TRANSIT) {
+    const nonTransitPayload: ShipmentEtaPayload = {
+      estimatedArrival: null,
+      reason: `ETA is available only for ${ShipmentStatus.IN_TRANSIT} shipments`,
+    };
+    await writeShipmentEtaCache(id, nonTransitPayload);
+    return nonTransitPayload;
+  }
+
+  const destination = resolveDestinationCoordinates(shipment.offChainMetadata);
+  if (!destination) {
+    throw new AppError(
+      400,
+      'Destination coordinates are missing in shipment metadata',
+      'ERR_SHIPMENT_ETA_DESTINATION_MISSING'
+    );
+  }
+
+  const points = (await Telemetry.find({ shipmentId: id })
+    .select('latitude longitude timestamp')
+    .sort({ timestamp: -1, _id: -1 })
+    .limit(ETA_POINTS_WINDOW)
+    .lean()) as TelemetryPoint[];
+
+  if (points.length === 0) {
+    throw new AppError(404, 'No GPS telemetry data points found', 'ERR_SHIPMENT_ETA_NO_GPS');
+  }
+
+  const latest = points[0];
+  const distanceRemaining = calculateDistanceKm(latest, destination);
+  const averageSpeedRaw = calculateAverageSpeedKmh(points);
+  const averageSpeed = Math.max(averageSpeedRaw, MIN_EFFECTIVE_SPEED_KMH);
+  const confidence = inferEtaConfidence(points.length, averageSpeedRaw);
+  const etaHours = distanceRemaining / averageSpeed;
+  const estimatedArrival = new Date(Date.now() + etaHours * 3600000).toISOString();
+
+  const payload: ShipmentEtaPayload = {
+    estimatedArrival,
+    distanceRemaining: Number(distanceRemaining.toFixed(3)),
+    averageSpeed: Number(averageSpeed.toFixed(3)),
+    confidence,
+  };
+
+  await writeShipmentEtaCache(id, payload);
+  return payload;
 };

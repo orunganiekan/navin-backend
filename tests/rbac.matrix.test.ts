@@ -4,8 +4,15 @@ import jwt from 'jsonwebtoken';
 import { randomUUID } from 'crypto';
 import mongoose from 'mongoose';
 import type { Application } from 'express';
-import { UserRole } from '../src/modules/users/users.model.js';
 import { env } from '../src/env.js';
+
+const UserRole = {
+  SUPER_ADMIN: 'SUPER_ADMIN',
+  ADMIN: 'ADMIN',
+  MANAGER: 'MANAGER',
+  VIEWER: 'VIEWER',
+  CUSTOMER: 'CUSTOMER',
+} as const;
 
 // Role definitions for the matrix
 const ROLES = [
@@ -32,6 +39,7 @@ const RBAC_MATRIX: Record<string, Role[]> = {
     UserRole.VIEWER,
     UserRole.CUSTOMER,
   ],
+  'GET /api/shipments/:id': [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.MANAGER, UserRole.VIEWER],
   'POST /api/shipments': [UserRole.ADMIN, UserRole.MANAGER],
   'PATCH /api/shipments/:id': [UserRole.ADMIN, UserRole.MANAGER],
   'DELETE /api/shipments/:id': [UserRole.SUPER_ADMIN, UserRole.ADMIN],
@@ -104,6 +112,10 @@ describe('RBAC Matrix Integration Tests', () => {
       findActiveShipmentBySensorId: jest.fn<any>(),
       updateTelemetryAnchor: jest.fn<any>(),
       markTelemetryAnchorFailed: jest.fn<any>(),
+      bulkIngestTelemetry: jest.fn<any>().mockResolvedValue([]),
+      getTelemetryThresholds: jest
+        .fn<any>()
+        .mockReturnValue({ minBatteryLevel: 20, maxTemperature: 25, maxHumidity: 80 }),
     }));
 
     await jest.unstable_mockModule('../src/modules/anomaly/anomaly.service.js', () => ({
@@ -112,7 +124,9 @@ describe('RBAC Matrix Integration Tests', () => {
         nextCursor: null,
         hasMore: false,
       }),
-      resolveAnomalyService: jest.fn<any>().mockResolvedValue({ _id: 'anomaly-1', status: 'RESOLVED' }),
+      resolveAnomalyService: jest
+        .fn<any>()
+        .mockResolvedValue({ _id: 'anomaly-1', status: 'RESOLVED' }),
       detectAnomaly: jest.fn<any>().mockResolvedValue({ detected: false, anomalies: [] }),
     }));
 
@@ -123,8 +137,12 @@ describe('RBAC Matrix Integration Tests', () => {
         hasMore: false,
       }),
       createShipmentService: jest.fn<any>().mockResolvedValue({ _id: 'shipment-1' }),
-      patchShipmentService: jest.fn<any>().mockResolvedValue({ _id: 'shipment-1', status: 'IN_TRANSIT' }),
-      updateShipmentStatusService: jest.fn<any>().mockResolvedValue({ _id: 'shipment-1', status: 'IN_TRANSIT' }),
+      patchShipmentService: jest
+        .fn<any>()
+        .mockResolvedValue({ _id: 'shipment-1', status: 'IN_TRANSIT' }),
+      updateShipmentStatusService: jest
+        .fn<any>()
+        .mockResolvedValue({ _id: 'shipment-1', status: 'IN_TRANSIT' }),
       uploadShipmentProofService: jest.fn<any>(),
       deleteShipmentService: jest.fn<any>(),
       findShipments: jest.fn<any>(),
@@ -218,7 +236,9 @@ describe('RBAC Matrix Integration Tests', () => {
     }));
 
     await jest.unstable_mockModule('../src/modules/webhooks/iot.service.js', () => ({
-      processIotWebhook: jest.fn<any>().mockResolvedValue({ _id: 'telemetry-1', shipmentId: 'shipment-1' }),
+      processIotWebhook: jest
+        .fn<any>()
+        .mockResolvedValue({ _id: 'telemetry-1', shipmentId: 'shipment-1' }),
     }));
 
     await jest.unstable_mockModule('../src/modules/auth/apiKey.service.js', () => ({
@@ -289,6 +309,37 @@ describe('RBAC Matrix Integration Tests', () => {
   }
 
   describe('Role-Based Access Control Matrix', () => {
+    // Test POST /api/users (admin-only user creation)
+    describe('POST /api/users', () => {
+      for (const role of ROLES) {
+        const allowedRoles = RBAC_MATRIX['POST /api/users'];
+        const shouldAllow = allowedRoles.includes(role);
+
+        it(`${role} ${shouldAllow ? 'should access' : 'should NOT access'} POST /api/users`, async () => {
+          const token = generateToken(role);
+
+          const res = await request(app)
+            .post('/api/users')
+            .set('Authorization', `Bearer ${token}`)
+            .send({ email: 'newuser@test.com', name: 'New User' });
+
+          if (shouldAllow) {
+            expect([201, 400, 409]).toContain(res.status);
+          } else {
+            expect(res.status).toBe(403);
+          }
+        });
+      }
+
+      it('should reject unauthenticated requests with 401', async () => {
+        const res = await request(app)
+          .post('/api/users')
+          .send({ email: 'newuser@test.com', name: 'New User' });
+
+        expect(res.status).toBe(401);
+      });
+    });
+
     // Test POST /api/shipments (create)
     describe('POST /api/shipments', () => {
       for (const role of ROLES) {
@@ -519,7 +570,7 @@ describe('RBAC Matrix Integration Tests', () => {
       expect(res.status).toBe(403);
     });
 
-    it('VIEWER can hit public user registration endpoint', async () => {
+    it('VIEWER should NOT be able to create users (admin-only endpoint)', async () => {
       const token = generateToken(UserRole.VIEWER);
 
       const res = await request(app)
@@ -532,7 +583,7 @@ describe('RBAC Matrix Integration Tests', () => {
           role: UserRole.VIEWER,
         });
 
-      expect([201, 400, 409]).toContain(res.status);
+      expect(res.status).toBe(403);
     });
 
     it('VIEWER should be able to read shipments', async () => {
@@ -593,7 +644,7 @@ describe('RBAC Matrix Integration Tests', () => {
         ['GET', '/api/shipments', true],
         ['GET', '/api/analytics/performance', true],
         ['GET', '/api/anomalies', true],
-        ['GET', '/api/telemetry', false],
+        ['GET', '/api/telemetry', true],
       ];
 
       for (const [method, path, requiresAuth] of endpoints) {
@@ -601,7 +652,10 @@ describe('RBAC Matrix Integration Tests', () => {
           path === '/api/analytics/performance'
             ? await request(app)
                 .get(path)
-                .query({ startDate: '2026-01-01T00:00:00.000Z', endDate: '2026-01-31T23:59:59.999Z' })
+                .query({
+                  startDate: '2026-01-01T00:00:00.000Z',
+                  endDate: '2026-01-31T23:59:59.999Z',
+                })
             : await request(app).get(path);
 
         if (requiresAuth) {

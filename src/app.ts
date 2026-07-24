@@ -15,12 +15,14 @@ import { buildHelmetMiddleware } from './config/helmet.js';
 import { healthRouter } from './modules/health/health.routes.js';
 import { usersRouter } from './modules/users/users.routes.js';
 import { authRouter } from './modules/auth/auth.routes.js';
+import { organizationsRouter } from './modules/organizations/organizations.routes.js';
 import { shipmentsRouter } from './modules/shipments/shipments.routes.js';
 import { paymentsRouter } from './modules/payments/payments.routes.js';
 import { webhooksRouter } from './modules/webhooks/iot.routes.js';
 import { analyticsRouter } from './modules/analytics/analytics.routes.js';
 import { anomaliesRouter } from './modules/anomaly/anomaly.routes.js';
 import { telemetryRouter } from './modules/telemetry/telemetry.routes.js';
+import { auditLogsRouter } from './modules/audit-logs/auditLogs.routes.js';
 
 const swaggerDocumentPath = fileURLToPath(new URL('../docs/swagger.yaml', import.meta.url));
 
@@ -34,7 +36,14 @@ export function buildApp() {
   app.use(requestId());
   app.use(corsMiddleware);
   app.options('*', corsPreflight);
-  app.use(express.json({ limit: '100kb' }));
+  app.use(
+    express.json({
+      limit: '100kb',
+      verify: (req: express.Request, _res, buf) => {
+        req.rawBody = buf;
+      },
+    })
+  );
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
   if (process.env.NODE_ENV !== 'production') {
@@ -47,12 +56,14 @@ export function buildApp() {
   app.use('/api/health', healthRouter);
   app.use('/api/auth', authRouter);
   app.use('/api/users', usersRouter);
+  app.use('/api/organizations', organizationsRouter);
   app.use('/api/shipments', shipmentsRouter);
   app.use('/api/payments', paymentsRouter);
   app.use('/api/webhooks', webhooksRouter);
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/anomalies', anomaliesRouter);
   app.use('/api/telemetry', telemetryRouter);
+  app.use('/api/audit-logs', auditLogsRouter);
 
   if (process.env.NODE_ENV !== 'production') {
     const swaggerDocument = YAML.load(swaggerDocumentPath) as Record<string, unknown>;
