@@ -7,26 +7,44 @@ import {
   updateShipmentStatusService,
   uploadShipmentProofService,
   deleteShipmentService,
+  getShipmentEtaService,
+  exportShipmentsService,
+  shipmentsToCSV,
 } from './shipments.service.js';
 import { sendResponse } from '../../shared/http/sendResponse.js';
-import type { GetShipmentsQuery } from './shipments.validation.js';
+import type { GetShipmentsQuery, ExportShipmentsQuery } from './shipments.validation.js';
+import { AppError, ErrorCodes } from '../../shared/http/errors.js';
 
 export const getShipments = async (req: Request, res: Response) => {
   const query = req.query as unknown as GetShipmentsQuery;
-  const { status, page = 1, limit = 20, origin, destination, ...filters } = query;
-  const { data, page: currentPage, limit: currentLimit, total } = await getShipmentsService({
+  const { status, page = 1, limit = 20, origin, destination, trackingNumber, q, from, to } = query;
+  // Build explicit filters object to avoid unvalidated query parameters
+  const filters: Record<string, unknown> = {};
+  if (req.user?.organizationId) {
+    filters.organizationId = req.user.organizationId;
+  }
+  const {
+    data,
+    page: currentPage,
+    limit: currentLimit,
+    total,
+  } = await getShipmentsService({
     status,
     page: Number(page),
     limit: Number(limit),
     origin,
     destination,
-    filters: filters as Record<string, unknown>,
+    trackingNumber,
+    q,
+    from,
+    to,
+    filters,
   });
 
-  sendResponse(res, 200, true, 'Shipments retrieved', data, { 
-    page: currentPage, 
-    limit: currentLimit, 
-    total 
+  sendResponse(res, 200, true, 'Shipments retrieved', data, {
+    page: currentPage,
+    limit: currentLimit,
+    total,
   });
 };
 
@@ -73,28 +91,51 @@ export const patchShipmentStatus = async (req: Request, res: Response) => {
 };
 
 export const uploadShipmentProof = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const { recipientSignatureName, notes } = req.body as {
-      recipientSignatureName?: string;
-      notes?: string;
-    };
-    const file = req.file;
+  const { id } = req.params;
+  const { recipientSignatureName, notes } = req.body as {
+    recipientSignatureName?: string;
+    notes?: string;
+  };
+  const file = req.file;
 
-    if (!file) {
-      sendResponse(res, 400, false, 'No file uploaded', null);
-      return;
-    }
-
-    const shipment = await uploadShipmentProofService(id, file, {
-      recipientSignatureName,
-      notes,
-    });
-
-    sendResponse(res, 200, true, 'Proof uploaded', shipment);
-  } catch {
-    sendResponse(res, 500, false, 'Server error', null);
+  if (!file) {
+    throw new AppError(400, 'No file uploaded', ErrorCodes.BAD_REQUEST);
   }
+
+  const shipment = await uploadShipmentProofService(id, file, {
+    recipientSignatureName,
+    notes,
+  });
+
+  sendResponse(res, 200, true, 'Proof uploaded', shipment);
+};
+
+export const exportShipments = async (req: Request, res: Response) => {
+  const query = req.query as unknown as ExportShipmentsQuery;
+  const { format = 'json', status, origin, destination, startDate, endDate } = query;
+  const organizationId = req.user?.organizationId;
+
+  const shipments = await exportShipmentsService({
+    organizationId,
+    status,
+    origin,
+    destination,
+    startDate,
+    endDate,
+  });
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+
+  if (format === 'csv') {
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="shipments-export-${dateStr}.csv"`);
+    res.status(200).send(shipmentsToCSV(shipments));
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="shipments-export-${dateStr}.json"`);
+  res.status(200).json(shipments);
 };
 
 export const deleteShipment = async (req: Request, res: Response) => {
@@ -107,4 +148,10 @@ export const deleteShipment = async (req: Request, res: Response) => {
   }
 
   sendResponse(res, 200, true, 'Shipment deleted successfully', shipment);
+};
+
+export const getShipmentEta = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const eta = await getShipmentEtaService(id);
+  sendResponse(res, 200, true, 'Shipment ETA retrieved', eta);
 };

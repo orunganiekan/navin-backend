@@ -13,6 +13,7 @@ import type {
   TelemetryUpdatePayload,
   AnomalyAlertPayload,
   StatusUpdatePayload,
+  PaymentStatusPayload,
 } from '../../shared/types/socketEvents.js';
 import { logger } from '../../shared/logger/logger.js';
 
@@ -99,4 +100,8 @@ export function emitTelemetryUpdate(shipmentId: string, telemetry: TelemetryUpda
 
 export function emitStatusUpdate(shipmentId: string, statusData: StatusUpdatePayload) {
   getIO().to(shipmentRoomName(shipmentId)).emit('status_update', statusData);
+}
+
+export function emitPaymentStatusChange(shipmentId: string, paymentData: PaymentStatusPayload) {
+  getIO().to(shipmentRoomName(shipmentId)).emit('payment_status_changed', paymentData);
 }

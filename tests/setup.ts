@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 
 jest.setTimeout(30_000);
 process.env.JWT_SECRET = 'test-jwt-secret-key-at-least-32-chars-long!';
+process.env.STELLAR_WEBHOOK_SECRET = 'test-stellar-webhook-secret-key';
 process.env.NODE_ENV = 'test';
 
 // Use MongoDB Memory Server URI if set by globalSetup

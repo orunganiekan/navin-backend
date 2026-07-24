@@ -1,5 +1,9 @@
 import { z } from 'zod';
-import { UserRole } from '../../shared/constants/index.js';
+import {
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_MIN_LENGTH_MESSAGE,
+  UserRole,
+} from '../../shared/constants/index.js';
 
 export const CreateUserBodySchema = z.object({
   email: z.string().email(),
@@ -19,5 +23,14 @@ export const VerifyInvitationQuerySchema = z.object({
 export const AcceptInvitationBodySchema = z.object({
   token: z.string().trim().min(1),
   name: z.string().trim().min(1),
-  password: z.string().min(6),
+  password: z.string().min(PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_MESSAGE),
 });
+
+export const ListUsersQuerySchema = z
+  .object({
+    limit: z.coerce.number().min(1).max(100).default(20),
+    cursor: z.string().optional(),
+  })
+  .strict();
+
+export type ListUsersQuery = z.infer<typeof ListUsersQuerySchema>;
