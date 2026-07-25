@@ -61,6 +61,19 @@ export interface StatusUpdatePayload {
 }
 
 /**
+ * Payment Status Payload
+ * Emitted when a payment status changes for a shipment
+ */
+export interface PaymentStatusPayload {
+  paymentId: string;
+  shipmentId: string;
+  oldStatus: string;
+  newStatus: string;
+  amount: number;
+  timestamp: string; // ISO 8601 UTC
+}
+
+/**
  * Socket Event Map
  * Defines all available socket events and their corresponding payload types
  */
@@ -68,6 +81,7 @@ export interface SocketEventMap {
   telemetry_update: TelemetryUpdatePayload;
   anomaly_detected: AnomalyAlertPayload;
   status_update: StatusUpdatePayload;
+  payment_status_changed: PaymentStatusPayload;
 }
 
 /**

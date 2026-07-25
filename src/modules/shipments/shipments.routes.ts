@@ -3,16 +3,20 @@ import { asyncHandler } from '../../shared/http/asyncHandler.js';
 import { validateRequest } from '../../shared/validation/validate.js';
 import {
   getShipments,
+  getShipmentById,
+  getShipmentTimeline,
   createShipment,
   patchShipment,
   patchShipmentStatus,
   uploadShipmentProof,
   deleteShipment,
+  getShipmentEta,
+  exportShipments,
 } from './shipments.controller.js';
 import { requireRole } from '../../shared/middleware/requireRole.js';
 import { requireAuth } from '../../shared/middleware/requireAuth.js';
 import { validate } from '../../shared/validation/validate.js';
-import { getShipmentsQuerySchema } from './shipments.validation.js';
+import { getShipmentsQuerySchema, ExportShipmentsQuerySchema } from './shipments.validation.js';
 import multer from 'multer';
 import {
   CreateShipmentBodySchema,
@@ -20,6 +24,8 @@ import {
   ShipmentPatchBodySchema,
   ShipmentProofBodySchema,
   ShipmentStatusBodySchema,
+  BulkStatusUpdateBodySchema,
+  ShipmentTimelineQuerySchema,
 } from './shipments.validation.js';
 
 import { UserRole } from '../../shared/constants/index.js';
@@ -27,7 +33,29 @@ import { UserRole } from '../../shared/constants/index.js';
 export const shipmentsRouter = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
-shipmentsRouter.get('/', validate({ query: getShipmentsQuerySchema }), asyncHandler(getShipments));
+shipmentsRouter.get(
+  '/export',
+  requireAuth,
+  requireRole(UserRole.ADMIN, UserRole.MANAGER),
+  validate({ query: ExportShipmentsQuerySchema }),
+  asyncHandler(exportShipments)
+);
+
+shipmentsRouter.get(
+  '/',
+  requireAuth,
+  requireRole(UserRole.ADMIN, UserRole.MANAGER, UserRole.VIEWER),
+  validate({ query: getShipmentsQuerySchema }),
+  asyncHandler(getShipments)
+);
+
+shipmentsRouter.get(
+  '/:id',
+  requireAuth,
+  requireRole(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.MANAGER, UserRole.VIEWER),
+  validateRequest({ params: ShipmentIdParamSchema }),
+  asyncHandler(getShipmentById)
+);
 shipmentsRouter.post(
   '/',
   requireAuth,
@@ -62,6 +90,13 @@ shipmentsRouter.delete(
   requireRole(UserRole.ADMIN, UserRole.MANAGER),
   validateRequest({ params: ShipmentIdParamSchema }),
   asyncHandler(deleteShipment)
+);
+
+shipmentsRouter.get(
+  '/:id/eta',
+  requireAuth,
+  validateRequest({ params: ShipmentIdParamSchema }),
+  asyncHandler(getShipmentEta)
 );
 
 export default shipmentsRouter;

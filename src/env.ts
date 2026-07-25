@@ -14,6 +14,11 @@ const EnvSchema = z.object({
     .trim()
     .regex(/^S[A-Z2-7]{20,}$/, 'STELLAR_SECRET_KEY must be a valid Stellar secret key')
     .optional(),
+  STELLAR_WEBHOOK_SECRET: z
+    .string()
+    .trim()
+    .min(16, 'STELLAR_WEBHOOK_SECRET must be at least 16 characters')
+    .optional(),
   STELLAR_NETWORK: z.enum(['testnet', 'public']).default('testnet'),
   ALLOWED_ORIGINS: z.string().default(''),
   REDIS_URL: z
